@@ -86,6 +86,43 @@ def _telegramize_command_mentions(text: str, platform: Any) -> str:
     return _TELEGRAM_COMMAND_MENTION_RE.sub(_replace, text)
 
 
+def _adapter_can_use_stream_consumer(
+    adapter: Any,
+    *,
+    chat_type: str = "",
+    metadata: Optional[Dict[str, Any]] = None,
+    transport: str = "auto",
+) -> tuple[bool, bool]:
+    """Return (allowed, supports_edit) for streaming setup.
+
+    Non-editable platforms must support native draft streaming before entering
+    GatewayStreamConsumer; otherwise its send/edit fallback can leave a partial
+    first message plus a duplicate final message.
+    """
+    supports_edit = bool(getattr(adapter, "SUPPORTS_MESSAGE_EDITING", True))
+    if supports_edit:
+        return True, True
+
+    if (transport or "auto").lower() not in ("auto", "draft"):
+        return False, False
+
+    try:
+        supports_draft = bool(
+            adapter.supports_draft_streaming(
+                chat_type=chat_type or None,
+                metadata=metadata,
+            )
+        )
+    except Exception:
+        logging.getLogger(__name__).debug(
+            "supports_draft_streaming probe raised during stream setup",
+            exc_info=True,
+        )
+        supports_draft = False
+
+    return supports_draft, False
+
+
 # Only auto-continue interrupted gateway turns while the interruption is fresh.
 # Stale tool-tail/resume markers can otherwise revive an unrelated old task
 # after a gateway restart when the user's next message starts new work.
@@ -15155,15 +15192,19 @@ class GatewayRunner:
                     from gateway.stream_consumer import GatewayStreamConsumer, StreamConsumerConfig
                     _adapter = self.adapters.get(source.platform)
                     if _adapter:
-                        # Platforms that don't support editing sent messages
-                        # (e.g. QQ, WeChat) should skip streaming entirely —
-                        # without edit support, the consumer sends a partial
-                        # first message that can never be updated, resulting in
-                        # duplicate messages (partial + final).
-                        _adapter_supports_edit = getattr(_adapter, "SUPPORTS_MESSAGE_EDITING", True)
-                        if not _adapter_supports_edit:
-                            raise RuntimeError("skip streaming for non-editable platform")
-                        _effective_cursor = _scfg.cursor
+                        _adapter_allowed_streaming, _adapter_supports_edit = (
+                            _adapter_can_use_stream_consumer(
+                                _adapter,
+                                chat_type=getattr(source, "chat_type", "") or "",
+                                metadata=_status_thread_metadata,
+                                transport=_scfg.transport or "auto",
+                            )
+                        )
+                        if not _adapter_allowed_streaming:
+                            raise RuntimeError(
+                                "skip streaming for non-editable platform without draft support"
+                            )
+                        _effective_cursor = _scfg.cursor if _adapter_supports_edit else ""
                         # Some Matrix clients render the streaming cursor
                         # as a visible tofu/white-box artifact.  Keep
                         # streaming text on Matrix, but suppress the cursor.
