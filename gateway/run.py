@@ -14664,6 +14664,10 @@ class GatewayRunner:
         
         # Queue for progress messages (thread-safe)
         progress_queue = queue.Queue() if tool_progress_enabled else None
+        native_progress_adapter = self.adapters.get(source.platform)
+        native_progress_enabled = callable(
+            getattr(native_progress_adapter, "send_tool_progress", None)
+        )
         last_tool = [None]  # Mutable container for tracking in closure
         last_progress_msg = [None]  # Track last message for dedup
         repeat_count = [0]  # How many times the same message repeated
@@ -14689,6 +14693,60 @@ class GatewayRunner:
         # several tools exceed the threshold.
         long_tool_hint_fired = [False]
         _LONG_TOOL_THRESHOLD_S = 30.0
+
+        def _tool_result_text_for_progress(result: Any) -> str:
+            try:
+                from run_agent import _multimodal_text_summary
+                text = _multimodal_text_summary(result)
+            except Exception:
+                if isinstance(result, str):
+                    text = result
+                else:
+                    try:
+                        text = json.dumps(result, ensure_ascii=False, default=str)
+                    except Exception:
+                        text = str(result)
+
+            try:
+                from agent.redact import redact_sensitive_text
+                text = redact_sensitive_text(text)
+            except Exception:
+                pass
+
+            max_chars = 4000
+            if len(text) > max_chars:
+                text = f"{text[:max_chars]}...(truncated {len(text) - max_chars} chars)"
+            return text
+
+        def _tool_error_for_progress(tool_name: str, result: Any) -> bool:
+            try:
+                from run_agent import _detect_tool_failure
+                is_error, _ = _detect_tool_failure(tool_name, result)
+                return bool(is_error)
+            except Exception:
+                return False
+
+        def _tool_start_callback_sync(tool_call_id: str, tool_name: str = None, args: dict = None):
+            if not progress_queue or not native_progress_enabled or not _run_still_current():
+                return
+            progress_queue.put({
+                "event": "tool.started",
+                "tool_call_id": tool_call_id,
+                "name": tool_name,
+                "args": args or {},
+            })
+
+        def _tool_complete_callback_sync(tool_call_id: str, tool_name: str = None, args: dict = None, result: Any = None):
+            if not progress_queue or not native_progress_enabled or not _run_still_current():
+                return
+            progress_queue.put({
+                "event": "tool.completed",
+                "tool_call_id": tool_call_id,
+                "name": tool_name,
+                "args": args or {},
+                "result": _tool_result_text_for_progress(result),
+                "is_error": _tool_error_for_progress(tool_name or "", result),
+            })
 
         def progress_callback(event_type: str, tool_name: str = None, preview: str = None, args: dict = None, **kwargs):
             """Callback invoked by agent on tool lifecycle events."""
@@ -14718,12 +14776,12 @@ class GatewayRunner:
                         )
                         if gate_on and not is_seen(_cfg, TOOL_PROGRESS_FLAG):
                             long_tool_hint_fired[0] = True
-                            progress_queue.put(tool_progress_hint_gateway())
-                            mark_seen(_hermes_home / "config.yaml", TOOL_PROGRESS_FLAG)
+                            if not native_progress_enabled:
+                                progress_queue.put(tool_progress_hint_gateway())
+                                mark_seen(_hermes_home / "config.yaml", TOOL_PROGRESS_FLAG)
                 except Exception as _hint_err:
                     logger.debug("tool-progress onboarding hint failed: %s", _hint_err)
                 return
-
 
             # Only act on tool.started events (ignore tool.completed, reasoning.available, etc.)
             if event_type not in {"tool.started",}:
@@ -14749,6 +14807,12 @@ class GatewayRunner:
             if progress_mode == "new" and tool_name == last_tool[0]:
                 return
             last_tool[0] = tool_name
+
+            if native_progress_enabled:
+                # Native sinks get structured start events from
+                # tool_start_callback, which includes the tool_call_id needed
+                # to update the same Kimi tool block with the final result.
+                return
             
             # Build progress message with primary argument preview
             from agent.display import get_tool_emoji
@@ -14832,6 +14896,63 @@ class GatewayRunner:
             adapter = self.adapters.get(source.platform)
             if not adapter:
                 return
+
+            native_tool_progress = getattr(adapter, "send_tool_progress", None)
+            if callable(native_tool_progress):
+                while True:
+                    try:
+                        if not _run_still_current():
+                            while not progress_queue.empty():
+                                try:
+                                    progress_queue.get_nowait()
+                                except Exception:
+                                    break
+                            return
+
+                        raw = progress_queue.get_nowait()
+                        if isinstance(raw, tuple) and len(raw) == 3 and raw[0] == "__dedup__":
+                            _, base_msg, count = raw
+                            payload = {"event": "tool.started", "text": f"{base_msg} (×{count + 1})"}
+                        elif isinstance(raw, tuple) and len(raw) >= 1 and raw[0] == "__reset__":
+                            last_progress_msg[0] = None
+                            repeat_count[0] = 0
+                            continue
+                        elif isinstance(raw, dict):
+                            payload = raw
+                        else:
+                            payload = {"event": "tool.started", "text": str(raw)}
+
+                        await native_tool_progress(
+                            source.chat_id,
+                            payload,
+                            metadata=_progress_metadata,
+                        )
+                    except queue.Empty:
+                        await asyncio.sleep(0.3)
+                    except asyncio.CancelledError:
+                        while not progress_queue.empty():
+                            try:
+                                raw = progress_queue.get_nowait()
+                                if isinstance(raw, tuple) and len(raw) >= 1 and raw[0] == "__reset__":
+                                    continue
+                                if isinstance(raw, tuple) and len(raw) == 3 and raw[0] == "__dedup__":
+                                    _, base_msg, count = raw
+                                    payload = {"event": "tool.started", "text": f"{base_msg} (×{count + 1})"}
+                                elif isinstance(raw, dict):
+                                    payload = raw
+                                else:
+                                    payload = {"event": "tool.started", "text": str(raw)}
+                                await native_tool_progress(
+                                    source.chat_id,
+                                    payload,
+                                    metadata=_progress_metadata,
+                                )
+                            except Exception:
+                                break
+                        return
+                    except Exception as e:
+                        logger.error("Native progress message error: %s", e)
+                        await asyncio.sleep(1)
 
             # Skip tool progress for platforms that don't support message
             # editing (e.g. iMessage/BlueBubbles) — each progress update
@@ -15344,6 +15465,16 @@ class GatewayRunner:
             # Per-message state — callbacks and reasoning config change every
             # turn and must not be baked into the cached agent constructor.
             agent.tool_progress_callback = progress_callback if tool_progress_enabled else None
+            agent.tool_start_callback = (
+                _tool_start_callback_sync
+                if tool_progress_enabled and native_progress_enabled
+                else None
+            )
+            agent.tool_complete_callback = (
+                _tool_complete_callback_sync
+                if tool_progress_enabled and native_progress_enabled
+                else None
+            )
             agent.step_callback = _step_callback_sync if _hooks_ref.loaded_hooks else None
             agent.stream_delta_callback = _stream_delta_cb
             agent.interim_assistant_callback = _interim_assistant_cb if _want_interim_messages else None
