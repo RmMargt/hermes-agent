@@ -19,6 +19,10 @@ from gateway.channel_directory import (
 )
 
 
+class _PlatformKey:
+    value = "kimi_claw"
+
+
 def _write_directory(tmp_path, platforms):
     """Helper to write a fake channel directory."""
     data = {"updated_at": "2026-01-01T00:00:00", "platforms": platforms}
@@ -51,6 +55,23 @@ class TestLoadDirectory:
 
 
 class TestBuildChannelDirectoryWrites:
+    def test_uses_adapter_list_channels_when_available(self, tmp_path):
+        adapter = SimpleNamespace(
+            list_channels=AsyncMock(
+                return_value=[
+                    {"id": "kimi-home", "name": "Kimi Home", "type": "dm"},
+                ]
+            )
+        )
+
+        with patch("gateway.channel_directory.DIRECTORY_PATH", tmp_path / "channel_directory.json"):
+            result = asyncio.run(build_channel_directory({_PlatformKey(): adapter}))
+
+        assert result["platforms"]["kimi_claw"] == [
+            {"id": "kimi-home", "name": "Kimi Home", "type": "dm"},
+        ]
+        adapter.list_channels.assert_awaited_once()
+
     def test_failed_write_preserves_previous_cache(self, tmp_path, monkeypatch):
         cache_file = _write_directory(tmp_path, {
             "telegram": [{"id": "123", "name": "Alice", "type": "dm"}]

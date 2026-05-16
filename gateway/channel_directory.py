@@ -69,7 +69,10 @@ async def build_channel_directory(adapters: Dict[Any, Any]) -> Dict[str, Any]:
 
     for platform, adapter in adapters.items():
         try:
-            if platform == Platform.DISCORD:
+            list_channels = getattr(adapter, "list_channels", None)
+            if callable(list_channels):
+                platforms[platform.value] = await list_channels()
+            elif platform == Platform.DISCORD:
                 platforms["discord"] = _build_discord(adapter)
             elif platform == Platform.SLACK:
                 platforms["slack"] = await _build_slack(adapter)
